@@ -1,0 +1,129 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import pandas as pd
+import numpy as np
+
+torch.autograd.set_detect_anomaly(True)  # ✅ Activăm debugging-ul
+
+class GAIN(nn.Module):
+    def __init__(self, input_dim, hidden_dim):
+        super(GAIN, self).__init__()
+        
+        self.generator = nn.Sequential(
+            nn.Linear(input_dim * 2, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, input_dim),
+            nn.Sigmoid()
+        )
+        
+        self.discriminator = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, input_dim),
+            nn.Sigmoid()
+        )
+    
+    def forward(self, x, mask):
+        generator_input = torch.cat((x, mask), dim=1)
+        generated_data = self.generator(generator_input)
+        imputed_data = mask * x + (1 - mask) * generated_data
+        discriminator_output = self.discriminator(imputed_data)
+        
+        return generated_data, discriminator_output, imputed_data
+
+# Functia de normalizare
+
+def normalize(data):
+    X_min = np.nanmin(data, axis=0)
+    X_max = np.nanmax(data, axis=0)
+    
+    diff = X_max - X_min
+    diff[diff == 0] = 1  # Evităm împărțirea la zero
+    
+    normalized_data = (data - X_min) / diff
+    return normalized_data, X_min, X_max
+
+# Functia de denormalizare
+
+def denormalize(data, X_min, X_max):
+    return data * (X_max - X_min) + X_min
+
+# Incarcam dataset-ul
+
+df = pd.read_csv("diabetes_readmission_NAN.csv")
+
+# Convertim dataset-ul intr-un array si normalizam
+
+data_array = df.values.astype(np.float32)
+normalized_data, X_min, X_max = normalize(data_array)
+
+# Cream mask matrix (1 pentru valori existente, 0 pentru NAN)
+
+mask = (1 - np.isnan(data_array)).astype(np.float32)
+
+# Inlocuim valorile NAN cu 0 in dataset-ul normalizat
+
+normalized_data[np.isnan(normalized_data)] = 0
+
+# Convertim in tensor PyThorch
+
+data_tensor = torch.tensor(normalized_data, dtype=torch.float32)
+mask_tensor = torch.tensor(mask, dtype=torch.float32)
+
+# Initializam modelul GAIN
+
+input_dim = data_tensor.shape[1]
+model = GAIN(input_dim, hidden_dim=128)
+
+# Definim optimizatori
+optimizer_G = torch.optim.Adam(model.generator.parameters(), lr=0.001)
+optimizer_D = torch.optim.Adam(model.discriminator.parameters(), lr=0.001)
+
+loss_fn = nn.BCELoss()
+
+# Antrenare pentru 10 epoci
+num_epochs = 10
+for epoch in range(num_epochs):
+    optimizer_G.zero_grad()
+    optimizer_D.zero_grad()
+    
+    generated_data, discriminator_output, imputed_data = model(data_tensor, mask_tensor)
+    
+    # Calculăm pierderile
+    generator_loss = torch.mean((mask_tensor * generated_data - mask_tensor * discriminator_output) ** 2)
+    discriminator_loss = torch.mean(mask_tensor * (1 - discriminator_output) + (1 - mask_tensor) * discriminator_output)
+    
+    total_loss = generator_loss + 10 * discriminator_loss
+    
+    # ✅ Debugging - Afișăm dacă există valori NaN în tensorii calculați
+    if torch.isnan(generator_loss).any() or torch.isnan(discriminator_loss).any():
+        print("NaN values detected in loss computation!")
+    
+    # ✅ Debugging - Verificăm forma tensorilor înainte de backward()
+    print(f"Epoch {epoch+1}/{num_epochs} - Generator Loss: {generator_loss.item()} - Discriminator Loss: {discriminator_loss.item()}")
+
+    # Antrenăm discriminatorul
+    discriminator_loss.backward(retain_graph=True)  # ✅ Adăugăm retain_graph
+    optimizer_D.step()
+    
+    optimizer_G.zero_grad()  # ✅ Resetăm optimizerul generatorului
+    
+    # Antrenăm generatorul
+    generator_loss.backward()  # ✅ Fără retain_graph aici
+    optimizer_G.step()
+    
+    print(f"Epoca {epoch+1}/{num_epochs} - Total Loss: {total_loss.item()}")
+
+# Salvăm rezultatele după antrenare
+imputed_array = imputed_data.detach().numpy()
+denormalized_imputed = denormalize(imputed_array, X_min, X_max)
+
+imputed_df = pd.DataFrame(denormalized_imputed, columns=df.columns)
+imputed_df.to_csv("diabetes_readmission_imputed_v3.csv", index=False)
+
+print("Antrenarea s-a terminat! Imputed Matrix a fost salvată în 'diabetes_readmission_imputed.csv'!")
