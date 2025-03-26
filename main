@@ -31,7 +31,7 @@ class GAIN(nn.Module):
     def forward(self, x, mask):
         generator_input = torch.cat((x, mask), dim=1)
         generated_data = self.generator(generator_input)
-        imputed_data = mask * x + (1 - mask) * generated_data
+        imputed_data = (mask * x + (1 - mask) * generated_data).detach().clone().requires_grad_()
         discriminator_output = self.discriminator(imputed_data)
         
         return generated_data, discriminator_output, imputed_data
@@ -73,7 +73,7 @@ normalized_data[np.isnan(normalized_data)] = 0
 # Convertim in tensor PyThorch
 
 data_tensor = torch.tensor(normalized_data, dtype=torch.float32)
-mask_tensor = torch.tensor(mask, dtype=torch.float32)
+mask_tensor = torch.tensor(mask, dtype=torch.float32, requires_grad=False)
 
 # Initializam modelul GAIN
 
@@ -86,7 +86,7 @@ optimizer_D = torch.optim.Adam(model.discriminator.parameters(), lr=0.001)
 
 loss_fn = nn.BCELoss()
 
-# Antrenare pentru 10 epoci
+# Antrenare pentru 10 iteratii
 num_epochs = 10
 for epoch in range(num_epochs):
     optimizer_G.zero_grad()
@@ -94,30 +94,57 @@ for epoch in range(num_epochs):
     
     generated_data, discriminator_output, imputed_data = model(data_tensor, mask_tensor)
     
+# Debugging tensors
+    print("Generated data requires_grad:", generated_data.requires_grad)
+    print("Discriminator output requires_grad:", discriminator_output.requires_grad)
+    print("Imputed data requires_grad:", imputed_data.requires_grad)
+    print("Mask Tensor requires_grad:", mask_tensor.requires_grad)
+    print("Data tensor requires_grad:", data_tensor.requires_grad)
+
+# Clonează imputed_data pentru a evita in-place modification
+
+imputed_data = imputed_data.clone()
+
     # Calculăm pierderile
-    generator_loss = torch.mean((mask_tensor * generated_data - mask_tensor * discriminator_output) ** 2)
-    discriminator_loss = torch.mean(mask_tensor * (1 - discriminator_output) + (1 - mask_tensor) * discriminator_output)
+
+generator_loss = torch.mean((mask_tensor * generated_data - mask_tensor * discriminator_output) ** 2)
+discriminator_loss = torch.mean(mask_tensor * (1 - discriminator_output) + (1 - mask_tensor) * discriminator_output)
     
-    total_loss = generator_loss + 10 * discriminator_loss
+total_loss = generator_loss + 10 * discriminator_loss
     
-    # ✅ Debugging - Afișăm dacă există valori NaN în tensorii calculați
-    if torch.isnan(generator_loss).any() or torch.isnan(discriminator_loss).any():
+    # Debugging - Afișăm dacă există valori NaN în tensorii calculați
+
+if torch.isnan(generator_loss).any() or torch.isnan(discriminator_loss).any():
         print("NaN values detected in loss computation!")
     
-    # ✅ Debugging - Verificăm forma tensorilor înainte de backward()
-    print(f"Epoch {epoch+1}/{num_epochs} - Generator Loss: {generator_loss.item()} - Discriminator Loss: {discriminator_loss.item()}")
+    # Debugging - Verificăm forma tensorilor înainte de backward()
+
+print(f"Epoch {epoch+1}/{num_epochs} - Generator Loss: {generator_loss.item()} - Discriminator Loss: {discriminator_loss.item()}")
 
     # Antrenăm discriminatorul
-    discriminator_loss.backward(retain_graph=True)  # ✅ Adăugăm retain_graph
-    optimizer_D.step()
+discriminator_loss.backward(retain_graph=True)  # Adăugăm retain_graph
+optimizer_D.step()
     
-    optimizer_G.zero_grad()  # ✅ Resetăm optimizerul generatorului
-    
+print("Discriminator step completat.")
+
+optimizer_G.zero_grad()  # Resetăm optimizerul generatorului
+
+print("Generator loss:", generator_loss.item())
+print("Verific NaN în generator_loss:", torch.isnan(generator_loss).any())
+print("Verific gradienți înainte de backward:")
+
+for name, param in model.generator.named_parameters():
+    if param.grad is not None:
+        print(f"{name} - grad norm: {param.grad.norm().item()}")
+    else:
+        print(f"{name} - gradient absent!")
+
     # Antrenăm generatorul
-    generator_loss.backward()  # ✅ Fără retain_graph aici
-    optimizer_G.step()
+generator_loss.backward()  # Fără retain_graph aici
+optimizer_G.step()
     
-    print(f"Epoca {epoch+1}/{num_epochs} - Total Loss: {total_loss.item()}")
+print("Generator step completat.")
+print(f"Iteratia {epoch+1}/{num_epochs} - Total Loss: {total_loss.item()}")
 
 # Salvăm rezultatele după antrenare
 imputed_array = imputed_data.detach().numpy()
@@ -126,4 +153,4 @@ denormalized_imputed = denormalize(imputed_array, X_min, X_max)
 imputed_df = pd.DataFrame(denormalized_imputed, columns=df.columns)
 imputed_df.to_csv("diabetes_readmission_imputed_v3.csv", index=False)
 
-print("Antrenarea s-a terminat! Imputed Matrix a fost salvată în 'diabetes_readmission_imputed.csv'!")
+print("Antrenarea s-a terminat! Imputed Matrix a fost salvată în 'diabetes_readmission_imputed_v3.csv'!")
