@@ -1,121 +1,178 @@
-
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
-import pandas as pd
 import numpy as np
+import pandas as pd
 
-# Activam modul de detectie a operatiilor in-place care pot strica graficul de calcul
 torch.autograd.set_detect_anomaly(True)
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# =====================
-# DEFINIM CLASA GAIN
-# =====================
+# ----------------------------------
+# Simplified GAIN cu pierdere adversariala BCE si de reconstructie
+# ----------------------------------
 class GAIN(nn.Module):
-    def __init__(self, input_dim, hidden_dim):
-        super(GAIN, self).__init__()
-
-        # Generatorul primeste date + masca si genereaza completari
-        self.generator = nn.Sequential(
+    def __init__(self, input_dim, hidden_dim=128):
+        super().__init__()
+        # Generator: primește datele incomplete + hint
+        self.gen = nn.Sequential(
             nn.Linear(input_dim * 2, hidden_dim),
-            nn.ReLU(),
+            nn.BatchNorm1d(hidden_dim),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(0.2),
+
             nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
+            nn.BatchNorm1d(hidden_dim),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(0.2),
+
+            # strat ascuns suplimentar
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(0.2),
+
+            nn.Linear(hidden_dim, input_dim),
+            nn.Tanh()
+        )
+
+        # Discriminator: primește datele completate + hint
+        self.disc = nn.Sequential(
+            nn.Linear(input_dim * 2, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(0.2),
+
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(0.2),
+
+            # strat ascuns suplimentar
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(0.2),
+
             nn.Linear(hidden_dim, input_dim),
             nn.Sigmoid()
         )
+    def forward(self, x_hat, mask, hint):
+        # Generator forward
+        gen_input = torch.cat([x_hat, hint], dim=1)           #concateneaza x_hat si hint pe axa de caracteristici
+        generated = self.gen(gen_input)                       #genereaza valorile lipsa
+        imputed = mask * x_hat + (1 - mask) * generated       #pastreaza valorile existente si inlocuieste missing
+        # Discriminator forward
+        disc_input = torch.cat([imputed, hint], dim=1)        #concateneaza imputarea si hint-ul
+        d_prob = self.disc(disc_input)                        #calculeaza probabilitatea pentru fiecare caracteristica
+        return generated, imputed, d_prob                     #returneaza: generator output, imputare, probabilitati
 
-        # Discriminatorul primeste date completate si decide ce e real vs. generat
-        self.discriminator = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, input_dim),
-            nn.Sigmoid()
-        )
-
-    def forward(self, x, mask):
-        generator_input = torch.cat([x, mask], dim=1) # concateneaza datele cu masca
-        generated_data = self.generator(generator_input) # genereaza valori lipsa
-        imputed_data = torch.where(mask.bool(), x, generated_data) # pastreaza valorile reale
-        return generated_data, imputed_data
-
-# ============================
-# NORMALIZARE & DENORMALIZARE
-# ============================
+# ----------------------------------
+# Normalize / Denormalize (Min-Max to [-1,1])
+# ----------------------------------
 def normalize(data):
-    X_min = np.nanmin(data, axis=0)
-    X_max = np.nanmax(data, axis=0)
-    diff = X_max - X_min
-    diff[diff == 0] = 1 # evitam impartirea la zero
-    return (data - X_min) / diff, X_min, X_max
+    dmin = np.nanmin(data, axis=0)                  #calculeaza minimul pe fiecare coloana
+    dmax = np.nanmax(data, axis=0)                  #calculeaza maximul pe fiecare coloana
+    span = dmax - dmin;                             #intervalul original (max-min) pentru fiecare coloana 
+    span[span==0] = 1                               #evita impartirea la zero daca max==min
+    scaled = 2 * (data - dmin) / span - 1           #re-scaleaza datele in intervalul [-1.1]
+    return scaled, dmin, dmax                       #returneaza datele normalizate si parametrii pentru denormalizare
 
-def denormalize(data, X_min, X_max):
-    return data * (X_max - X_min) + X_min
+def denormalize(data, dmin, dmax):                  #inverseaza normalizarea: din [-1,1] -> [min,max] original
+    return (data + 1) / 2 * (dmax - dmin) + dmin
 
-# ================
-# INCARCARE DATE
-# ================
-df = pd.read_csv("diabetes_readmission_NAN.csv") # date cu valori lipsa
-mask_df = pd.read_csv("diabetes_readmission_NAN_to_mask.csv") # matrice masca
-data_array = df.values.astype(np.float32)
-mask_array = mask_df.values.astype(np.float32)
-normalized_data, X_min, X_max = normalize(data_array)
-normalized_data[np.isnan(normalized_data)] = 0 # inlocuim NaN cu 0
+# ----------------------------------
+# Incarcare date si pregatire tensori
+# ----------------------------------
+df = pd.read_csv("diabetes_readmission_NAN.csv")                  #citeste tabelul cu date incomplete (NAN)
+mask_df = pd.read_csv("diabetes_readmission_NAN_to_mask.csv")     #citeste masca (1 pentru date prezente, 0 pentru lipsa)
+true_df = pd.read_csv("diabetes_readmission.csv")                 #citeste tabelul complet cu date reale pentru calculul pierderii pe missing
 
-# convertim in tensori PyTorch
-data_tensor = torch.tensor(normalized_data, dtype=torch.float32)
-mask_tensor = torch.tensor(mask_array, dtype=torch.float32)
+data_np = df.values.astype(np.float32)
+mask_np = mask_df.values.astype(np.float32)
+true_np = true_df.values.astype(np.float32)
 
-# =============
-# INITIALIZARE
-# =============
-input_dim = data_tensor.shape[1]
-model = GAIN(input_dim=input_dim, hidden_dim=128)
+# normalize and fill NaN with 0
+norm_np, dmin, dmax = normalize(data_np)
+norm_np[np.isnan(norm_np)] = 0
+norm_true, _, _ = normalize(true_np)
+norm_true[np.isnan(norm_true)] = 0
 
-# Optimizatori pentru generator si discriminator
-optimizer_G = optim.Adam(model.generator.parameters(), lr=0.001)
-optimizer_D = optim.Adam(model.discriminator.parameters(), lr=0.001)
+x = torch.tensor(norm_np, device=device)
+m = torch.tensor(mask_np, device=device)
+true_x = torch.tensor(norm_true, device=device)
 
-# =============
+# ----------------------------------
+# Parametrii si initializarea modelului
+# ----------------------------------
+input_dim = x.size(1)
+model = GAIN(input_dim).to(device)     #creeaza modelul GAIN si il muta pe GPU/CPU
+optimizer_G = optim.Adam(model.gen.parameters(), lr=5e-4, betas=(0.5,0.999))    #rata de invatare generator
+optimizer_D = optim.Adam(model.disc.parameters(), lr=1e-4, betas=(0.5,0.999))   #rata de invatare discriminator
+bce = nn.BCELoss(reduction='none')     #functia de BCE fara mediere interna
+num_epochs = 100                       #numarul total de iteratii
+lambda_recon = 200     #pondere pierdere reconstructie pe valori observate          
+lambda_miss = 1500     #pondere pierdere reconstructie pe valori lipsa
+
+batch_size = x.size(0)
+
+# ----------------------------------
 # ANTRENARE
-# =============
-num_epochs = 100
-for epoch in range(num_epochs):
-    generated_data, imputed_data = model(data_tensor, mask_tensor)  # forward prin model
-    inv_mask = 1.0 - mask_tensor # inverseaza masca pentru zonele lipsa
+# ----------------------------------
+for epoch in range(1, num_epochs+1):
+    # annealing liniar de la 1.0 → 0.1
+    p_hint = 1.0 - 0.9 * (epoch-1)/(num_epochs-1)   #calculeaza probabilitatea hint-ului care scade liniar
+    # --- Generare hint ---
+    rnd = torch.rand_like(m)  # generează tensor aleator cu aceleași dimensiuni ca masc
+    hint = (rnd < p_hint).float() * m + 0.5 * (1 - (rnd < p_hint).float())
 
-    # ----- DISCRIMINATOR -----
-    imputed_for_disc = imputed_data.detach() # decupleaza de la graficul anterior
-    disc_output_disc = model.discriminator(imputed_for_disc) # predictii discriminator
-    # loss: vrea sa prezica 1 pt. valori reale si 0 pt. completate
-    discriminator_loss = torch.mean(mask_tensor * (1 - disc_output_disc) + inv_mask * disc_output_disc)
+    # --- Forward generator + build imputed ---
+    gen_input = torch.cat([x, hint], dim=1)  # concatenează intrările x și hint pe axa caracteristicilor
+    generated = model.gen(gen_input)   # trece prin generator și generează valori pentru missing
+    imputed = m * x + (1 - m) * generated   # combină valorile reale cu cele generate
 
-    optimizer_D.zero_grad()
-    discriminator_loss.backward() # backward pass
-    optimizer_D.step()
+    # --- Discriminator update ---
+    real_input = torch.cat([x, hint], dim=1)   # intrarea reală pentru discriminator
+    d_real = model.disc(real_input)            # scorul discriminatorului pe date reale
+    fake_input = torch.cat([imputed.detach(), hint], dim=1)   # intrarea fake fără gradent către G
+    d_fake = model.disc(fake_input)   # scorul discriminatorului pe date generate                    
 
-     # ----- GENERATOR -----
-    with torch.no_grad():
-        _, imputed_for_gen = model(data_tensor, mask_tensor) # refacem forward pt. generator
-    imputed_for_gen = imputed_for_gen.detach().clone().requires_grad_(True)
+    loss_D = ( m * bce(d_real, torch.ones_like(d_real))
+             + (1-m) * bce(d_fake, torch.zeros_like(d_fake)) ).mean()    # pierdere BCE: real→1 , fake→0
+    
+    optimizer_D.zero_grad()   #reseteaza gradientele discriminatorului
+    loss_D.backward()        #calculeaza gradientele pentru discriminator
+    optimizer_D.step()        #actualizeaza parametrii discriminator
 
-    disc_output_gen = model.discriminator(imputed_for_gen)
-    # loss: vrea sa pacaleasca discriminatorul in zonele lipsa
-    generator_loss = torch.mean((inv_mask * disc_output_gen - inv_mask * generated_data.detach()) ** 2)
+    # --- Generator update ---
+    fake_input_forG = torch.cat([imputed, hint], dim=1)   # intrarea fake cu gradient pentru G
+    d_fake_forG = model.disc(fake_input_forG)        # scorul discriminatorului pe fake (cu grad)
 
+    adv_loss = ((1-m) * bce(d_fake_forG, torch.ones_like(d_fake_forG))).mean()     # pierdere adversarială: vrem fake→1
+    rec_loss = (m * (generated - x)**2).mean()       # pierdere MSE pe pozițiile observate
+    # reconstruction on missing using ground-truth
+    rec_miss = ((1-m) * (generated - true_x)**2).mean()       # pierdere MSE pe pozițiile lipsă
+
+    loss_G = adv_loss \
+           + lambda_recon * rec_loss \
+           + lambda_miss * rec_miss           # sumă ponderată a tuturor pierderilor
+    
     optimizer_G.zero_grad()
-    generator_loss.backward()
+    loss_G.backward() 
     optimizer_G.step()
 
-    print(f"Epoch {epoch+1}: GenLoss = {generator_loss.item():.6f}, DiscLoss = {discriminator_loss.item():.6f}")
+    # --- RMSE_missing & log ---
+    mse_miss = ((1-m) * (generated - true_x)**2).sum()/(1-m).sum()
+    rmse = torch.sqrt(mse_miss)
+    print(f"Epoch {epoch}/{num_epochs} | D_loss={loss_D:.4f} | G_loss={loss_G:.4f} | RMSE_missing={rmse:.4f}")
 
-# =============
-# SALVARE REZULTATE
-# =============
-final_imputed = imputed_data.detach().numpy()
-denormalized = denormalize(final_imputed, X_min, X_max) # aducem inapoi in valori reale
-output_df = pd.DataFrame(denormalized, columns=df.columns)
-output_df.to_csv("diabetes_readmission_imputed_final_100_epochs.csv", index=False)
-print("Model antrenat și fișier salvat!")
+# ----------------------------------
+# Save imputations
+# ----------------------------------
+with torch.no_grad():
+    _, imp_final, _ = model(x, m, torch.zeros_like(m))
+    imp_np = imp_final.cpu().numpy()
+    final_np = denormalize(imp_np, dmin, dmax)
+    pd.DataFrame(final_np, columns=df.columns).to_csv(
+        "diabetes_readmission_imputed_with_missing_loss_lambda_1500_Tanh_strat_suplimentar_lr_5e_4.csv", index=False)
+print("Training complete and results saved.")
