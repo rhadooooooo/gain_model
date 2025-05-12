@@ -12,7 +12,7 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 # Simplified GAIN cu pierdere adversariala BCE si de reconstructie
 # ----------------------------------
 class GAIN(nn.Module):
-    def __init__(self, input_dim, hidden_dim=128, p_dropout=0.2):
+    def __init__(self, input_dim, hidden_dim=512, p_dropout=0.05):
         super().__init__()
         # Generator: 
         self.gen = nn.Sequential(
@@ -84,19 +84,20 @@ data_np = df.values.astype(np.float32)
 mask_np = mask_df.values.astype(np.float32)
 true_np = true_df.values.astype(np.float32)
 
-# compute per-column mean & std only on observed values
-mu = np.zeros(data_np.shape[1], dtype=np.float32)
-sigma = np.zeros(data_np.shape[1], dtype=np.float32)
-for j in range(data_np.shape[1]):
-    obs = data_np[mask_np[:,j]==1, j]
-    mu[j]    = np.nanmean(obs)
-    sigma[j] = np.nanstd(obs) if np.nanstd(obs)>0 else 1.0
-
 # normalize & fill NaN with 0
 norm_np, dmin, dmax   = normalize(data_np)
 norm_np[np.isnan(norm_np)] = 0
 norm_true, _, _       = normalize(true_np)
 norm_true[np.isnan(norm_true)] = 0
+
+# compute per-column mean & std only on observed values
+mu = np.zeros(norm_np.shape[1], dtype=np.float32)
+sigma = np.zeros(norm_np.shape[1], dtype=np.float32)
+for j in range(norm_np.shape[1]):
+    obs = norm_np[mask_np[:,j]==1, j]
+    mu[j]    = np.nanmean(obs)
+    sigma[j] = np.nanstd(obs) if np.nanstd(obs)>0 else 1.0
+
 
 x      = torch.tensor(norm_np, device=device)
 m      = torch.tensor(mask_np, device=device)
@@ -108,13 +109,30 @@ sigma_t= torch.tensor(sigma, device=device).unsqueeze(0)
 # Parametrii & initializarea modelului
 # ----------------------------------
 input_dim   = x.size(1)
-model       = GAIN(input_dim, hidden_dim=128).to(device)
-optimizer_G = optim.Adam(model.gen.parameters(),  lr=5e-4, betas=(0.5,0.999))
-optimizer_D = optim.Adam(model.disc.parameters(), lr=1e-4, betas=(0.5,0.999))
+model       = GAIN(input_dim, hidden_dim=512).to(device)
+optimizer_G = optim.Adam(model.gen.parameters(),  lr=1e-4, betas=(0.5,0.999))
+optimizer_D = optim.Adam(model.disc.parameters(), lr=5e-5, betas=(0.5,0.999))
 bce         = nn.BCELoss(reduction='none')
-num_epochs  = 300
-lambda_recon= 100
-lambda_miss = 1500
+num_epochs  = 400
+warm_epochs  = 20
+lambda_recon= 500
+lambda_miss = 1000
+
+# ----------------------------------
+# Warm-start: pre-antrenează generator doar pe rec_miss
+# ----------------------------------
+for ws in range(1, warm_epochs+1):
+    # sample static Gaussian noise z pentru missing
+    z = torch.randn_like(x) * sigma_t + mu_t
+    x_hat = m * x + (1-m) * z
+    # forward only generator
+    gen_input = torch.cat([x_hat, torch.zeros_like(m)], dim=1)
+    generated = model.gen(gen_input)
+    rec_miss = ((1-m) * (generated - true_x)**2).mean()
+    optimizer_G.zero_grad()
+    rec_miss.backward()
+    optimizer_G.step()
+    print(f"Warm-start {ws}/{warm_epochs} | rec_miss={rec_miss:.4f}")
 
 # ----------------------------------
 # ANTRENARE
@@ -126,17 +144,18 @@ for epoch in range(1, num_epochs+1):
     hint   = (rnd < p_hint).float() * m + 0.5 * (1 - (rnd < p_hint).float())
 
     # --- generează zgomot gaussian static pentru missing ---
-    # z ~ N(mu_j, sigma_j^2) per coloană
     z = torch.randn_like(x) * sigma_t + mu_t
 
-    # construit x_hat cu zgomotul static
-    x_hat = m * x + (1 - m) * z
+    # MSE și RMSE doar pentru imputarea statică (z) pe pozițiile lipsă
+    mse_static  = ((1-m) * (z - true_x)**2).sum() / (1-m).sum()
+    rmse_static = torch.sqrt(mse_static)
 
-    # forward through generator
+    # construit x_hat cu zgomotul static și forward prin generator
+    x_hat      = m * x + (1 - m) * z
     generated, imputed, _ = model(x_hat, m, hint)
 
     # --- Discriminator update ---
-    d_real = model.disc(torch.cat([m * x + (1-m)*z, hint], dim=1))
+    d_real = model.disc(torch.cat([m*x + (1-m)*z, hint], dim=1))
     d_fake = model.disc(torch.cat([imputed.detach(), hint], dim=1))
     loss_D = ( m * bce(d_real, torch.ones_like(d_real))
              + (1-m) * bce(d_fake, torch.zeros_like(d_fake)) ).mean()
@@ -150,15 +169,18 @@ for epoch in range(1, num_epochs+1):
     loss_G    = adv_loss + lambda_recon*rec_loss + lambda_miss*rec_miss
     optimizer_G.zero_grad(); loss_G.backward(); optimizer_G.step()
 
-    # --- metrici ---
-    mse_miss   = ((1-m)*(generated-true_x)**2).sum()/(1-m).sum()
-    rmse_miss  = torch.sqrt(mse_miss)
-    mse_global = ((imputed-true_x)**2).mean()
-    rmse_glob  = torch.sqrt(mse_global)
+    # --- metrici GAIN ---
+    mse_gain   = ((1-m) * (generated - true_x)**2).sum()/(1-m).sum()
+    rmse_gain  = torch.sqrt(mse_gain)
+    rmse_glob  = torch.sqrt(((imputed - true_x)**2).mean())
 
-    print(f"Epoch {epoch}/{num_epochs} | D_loss={loss_D:.4f} "
-          f"| G_loss={loss_G:.4f} | RMSE_missing={rmse_miss:.4f} "
-          f"| RMSE_global={rmse_glob:.4f}")
+    print(
+        f"Epoch {epoch}/{num_epochs} | "
+        f"D_loss={loss_D:.4f} | G_loss={loss_G:.4f} | "
+        f"RMSE_static={rmse_static:.4f} | "
+        f"RMSE_missing_GAIN={rmse_gain:.4f} | "
+        f"RMSE_global={rmse_glob:.4f}"
+    )
 
 # ----------------------------------
 # Salvare rezultate
@@ -168,6 +190,6 @@ with torch.no_grad():
     imp_np = imp_final.cpu().numpy()
     final_np = denormalize(imp_np, dmin, dmax)
     pd.DataFrame(final_np, columns=df.columns).to_csv(
-        "diabetes_readmission_imputed_static_gauss.csv", index=False)
+        "diabetes_readmission_imputed_static_gauss_warm_start_G_lr_1e-4_epochs_400_lrcon_500_lmiss_1000_h_dim_512_p_drop_005_RMSE_static_.csv", index=False)
 
 print("Antrenare completa si salvata!.")
